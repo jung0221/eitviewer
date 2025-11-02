@@ -1,4 +1,4 @@
-condviz_gui
+eitviewer
 ===========
 
 Simple Qt6 + VTK viewer for visualizing conductivity fields on 3D meshes.
