@@ -9,6 +9,7 @@
 #include <QVBoxLayout>
 #include <QApplication>
 #include <QWidget>
+#include <iostream>
 
 #include <vtkActor.h>
 #include <vtkCutter.h>
@@ -52,7 +53,12 @@
 #include <unordered_map>
 #include <array>
 
+#include <vtkCellType.h>
+#include <vtkCellArray.h>
+#include <vtkIdList.h>
+
 #include <QVTKOpenGLNativeWidget.h>
+#include <vtkIntArray.h>
 #include <QProcess>
 #include <QDir>
 #include <QFileInfo>
@@ -78,14 +84,299 @@ bool ConductivityViewer::loadMeshFile(const QString &path)
 
   vtkSmartPointer<vtkDataSet> data;
 
+  // Inline parser for Gmsh .msh files: reads $Nodes, $Elements and $NodeData and
+  // constructs a vtkUnstructuredGrid with a point array named "conductivity".
+  auto parseMshFile = [](const QString &mshPath) -> vtkSmartPointer<vtkUnstructuredGrid>
+  {
+    std::ifstream ifs(mshPath.toStdString());
+    if (!ifs)
+    {
+      qDebug() << "Failed to open" << mshPath;
+      return nullptr;
+    }
+
+    // helper: trim whitespace (including CR/LF) from both ends of a line
+    auto trim = [&](std::string &s)
+    {
+      while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back())))
+        s.pop_back();
+      while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front())))
+        s.erase(0, 1);
+    };
+
+    vtkNew<vtkPoints> points;
+    vtkNew<vtkUnstructuredGrid> ug;
+    vtkNew<vtkIntArray> idArr;
+    idArr->SetName("gmsh_node_id");
+    idArr->SetNumberOfComponents(1);
+
+    std::unordered_map<int, vtkIdType> nodeIdToIndex;
+    std::vector<int> nodeOrder; // preserves the order nodes were defined
+
+    struct ElemRecord
+    {
+      int type;
+      std::vector<int> nodeIds;
+    };
+    std::vector<ElemRecord> elements;
+
+    std::string line;
+    while (std::getline(ifs, line))
+    {
+      trim(line);
+      if (line.size() == 0)
+        continue;
+      if (line == "$Nodes")
+      {
+        // read number of nodes
+        if (!std::getline(ifs, line))
+          break;
+        trim(line);
+        int n = std::stoi(line);
+        for (int i = 0; i < n; ++i)
+        {
+          if (!std::getline(ifs, line))
+            break;
+          trim(line);
+          if (line.size() == 0)
+          {
+            --i;
+            continue;
+          }
+          std::istringstream iss(line);
+          int id;
+          double x, y, z;
+          iss >> id >> x >> y >> z;
+          vtkIdType idx = points->InsertNextPoint(x, y, z);
+          nodeIdToIndex[id] = idx;
+          nodeOrder.push_back(id);
+          idArr->InsertNextValue(id);
+        }
+      }
+      else if (line == "$Elements")
+      {
+        if (!std::getline(ifs, line))
+          break;
+        trim(line);
+        int ne = std::stoi(line);
+        for (int i = 0; i < ne; ++i)
+        {
+          if (!std::getline(ifs, line))
+            break;
+          trim(line);
+          if (line.size() == 0)
+          {
+            --i;
+            continue;
+          }
+          std::istringstream iss(line);
+          int elemId, elemType, numTags;
+          iss >> elemId >> elemType >> numTags;
+          for (int t = 0; t < numTags; ++t)
+          {
+            int tmp;
+            iss >> tmp;
+          }
+          std::vector<int> nids;
+          int nid;
+          while (iss >> nid)
+            nids.push_back(nid);
+          elements.push_back({elemType, nids});
+        }
+      }
+      else if (line == "$NodeData")
+      {
+        // Parse tags according to Gmsh MSH specification
+        auto readNonEmpty = [&](std::string &out) -> bool
+        {
+          while (std::getline(ifs, out))
+          {
+            trim(out);
+            if (!out.empty())
+              return true;
+          }
+          return false;
+        };
+
+        std::string s;
+        if (!readNonEmpty(s))
+          break;
+        int numStringTags = std::stoi(s);
+        for (int i = 0; i < numStringTags; ++i)
+        {
+          std::getline(ifs, s);
+        }
+        if (!readNonEmpty(s))
+          break;
+        int numRealTags = std::stoi(s);
+        for (int i = 0; i < numRealTags; ++i)
+        {
+          std::getline(ifs, s);
+        }
+        if (!readNonEmpty(s))
+          break;
+        int numIntTags = std::stoi(s);
+        std::vector<int> intTags;
+        for (int i = 0; i < numIntTags; ++i)
+        {
+          if (!readNonEmpty(s))
+            break;
+          intTags.push_back(std::stoi(s));
+        }
+
+        // Now, read data lines until $EndNodeData
+        std::vector<double> orderedValues;
+        std::vector<std::pair<int, double>> pairs;
+        while (std::getline(ifs, s))
+        {
+          if (s == "$EndNodeData")
+            break;
+          if (s.empty())
+            continue;
+          std::istringstream iss(s);
+          std::vector<std::string> toks;
+          std::string tok;
+          while (iss >> tok)
+            toks.push_back(tok);
+          if (toks.size() >= 2)
+          {
+            // try nodeID value pair
+            try
+            {
+              int nid = std::stoi(toks[0]);
+              double val = std::stod(toks[1]);
+              pairs.emplace_back(nid, val);
+            }
+            catch (...)
+            {
+              try
+              {
+                orderedValues.push_back(std::stod(toks[0]));
+              }
+              catch (...)
+              {
+              }
+            }
+          }
+          else if (toks.size() == 1)
+          {
+            try
+            {
+              orderedValues.push_back(std::stod(toks[0]));
+            }
+            catch (...)
+            {
+            }
+          }
+        }
+
+        // Build conductivity array
+        vtkNew<vtkDoubleArray> cond;
+        cond->SetName("conductivity");
+        cond->SetNumberOfComponents(1);
+        vtkIdType npoints = points->GetNumberOfPoints();
+        cond->SetNumberOfTuples(npoints);
+        double nanv = std::numeric_limits<double>::quiet_NaN();
+        for (vtkIdType i = 0; i < npoints; ++i)
+          cond->SetTuple1(i, nanv);
+
+        if (!pairs.empty())
+        {
+          for (auto &pr : pairs)
+          {
+            int nid = pr.first;
+            double val = pr.second;
+            auto it = nodeIdToIndex.find(nid);
+            if (it != nodeIdToIndex.end())
+              cond->SetTuple1(it->second, val);
+            else
+              qDebug() << "Node id" << nid << "in $NodeData not present in $Nodes";
+          }
+        }
+        else if (!orderedValues.empty() && (vtkIdType)orderedValues.size() == npoints)
+        {
+          for (vtkIdType i = 0; i < npoints; ++i)
+            cond->SetTuple1(i, orderedValues[(size_t)i]);
+        }
+        else if (!orderedValues.empty())
+        {
+          qDebug() << "NodeData values count" << (int)orderedValues.size() << "does not match number of nodes" << (int)npoints;
+        }
+
+        ug->GetPointData()->AddArray(cond);
+        // also expose original gmsh node ids if available
+        if (idArr->GetNumberOfTuples() == points->GetNumberOfPoints())
+          ug->GetPointData()->AddArray(idArr);
+        ug->GetPointData()->SetScalars(cond);
+      }
+    }
+
+    // Insert elements as cells into unstructured grid
+    for (const auto &er : elements)
+    {
+      int gmshType = er.type;
+      int vtkType = -1;
+      switch (gmshType)
+      {
+      case 1:
+        vtkType = VTK_LINE;
+        break;
+      case 2:
+        vtkType = VTK_TRIANGLE;
+        break;
+      case 3:
+        vtkType = VTK_QUAD;
+        break;
+      case 4:
+        vtkType = VTK_TETRA;
+        break;
+      case 5:
+        vtkType = VTK_HEXAHEDRON;
+        break;
+      case 6:
+        vtkType = VTK_WEDGE;
+        break;
+      case 7:
+        vtkType = VTK_PYRAMID;
+        break;
+      default:
+        vtkType = -1;
+        break;
+      }
+      if (vtkType < 0)
+        continue; // skip unsupported types
+
+      vtkNew<vtkIdList> idList;
+      bool ok = true;
+      for (int nid : er.nodeIds)
+      {
+        auto it = nodeIdToIndex.find(nid);
+        if (it == nodeIdToIndex.end())
+        {
+          ok = false;
+          break;
+        }
+        idList->InsertNextId(it->second);
+      }
+      if (!ok)
+        continue;
+      ug->InsertNextCell(vtkType, idList);
+    }
+
+    ug->SetPoints(points);
+    return ug;
+  };
   // Handle Gmsh .msh: first try converting with gmsh CLI to a .vtk file (no Python required).
   QString localPath = path;
   if (ext == "msh")
   {
     QString tmpdir = QDir::tempPath();
     QString base = QFileInfo(path).baseName();
-    // creates a temporary mesh with vtu format (converted from .msh) 
-    QString out = tmpdir + "/condviz_" + base + "_" + QString::number(QDateTime::currentSecsSinceEpoch()) + ".vtu";
+    // creates a temporary mesh with vtu format (converted from .msh)
+    QString out = tmpdir + "/eitviewer_" + base + "_" + QString::number(QDateTime::currentSecsSinceEpoch()) + ".vtu";
+    // Try parsing the .msh directly (pure C++). If successful, we will skip
+    // external conversion and use the in-memory unstructured grid.
+    vtkSmartPointer<vtkUnstructuredGrid> parsedGrid = parseMshFile(path);
 
     // Prefer using Python + meshio so we avoid launching gmsh GUI. Try several python executables
     QStringList pythonCandidates;
@@ -162,7 +453,7 @@ bool ConductivityViewer::loadMeshFile(const QString &path)
     }
   }
 
-  if (ext == "vtu")
+  if (!data && ext == "vtu")
   {
     vtkNew<vtkXMLUnstructuredGridReader> r;
     r->SetFileName(localPath.toStdString().c_str());
@@ -172,21 +463,24 @@ bool ConductivityViewer::loadMeshFile(const QString &path)
   else
   {
     // try generic legacy reader
-    vtkNew<vtkGenericDataObjectReader> r;
-    r->SetFileName(localPath.toStdString().c_str());
-    r->Update();
-    if (r->IsFileUnstructuredGrid())
+    if (!data)
     {
-      data = vtkUnstructuredGrid::SafeDownCast(r->GetOutput());
-    }
-    else if (r->IsFilePolyData())
-    {
-      data = vtkPolyData::SafeDownCast(r->GetOutput());
-    }
-    else
-    {
-      statusBar()->showMessage(tr("Unsupported file type or empty output"));
-      return false;
+      vtkNew<vtkGenericDataObjectReader> r;
+      r->SetFileName(localPath.toStdString().c_str());
+      r->Update();
+      if (r->IsFileUnstructuredGrid())
+      {
+        data = vtkUnstructuredGrid::SafeDownCast(r->GetOutput());
+      }
+      else if (r->IsFilePolyData())
+      {
+        data = vtkPolyData::SafeDownCast(r->GetOutput());
+      }
+      else
+      {
+        statusBar()->showMessage(tr("Unsupported file type or empty output"));
+        return false;
+      }
     }
   }
 
@@ -210,8 +504,8 @@ bool ConductivityViewer::loadMeshFile(const QString &path)
   }
 
   // Find a scalar array in point data (prefer the active scalars)
-  vtkPointData* pd = pointDataSource->GetPointData();
-  vtkDataArray* scalars = pd->GetScalars();
+  vtkPointData *pd = pointDataSource->GetPointData();
+  vtkDataArray *scalars = pd->GetScalars();
   if (!scalars && pd->GetNumberOfArrays() > 0)
     scalars = pd->GetArray(0);
 
@@ -221,10 +515,24 @@ bool ConductivityViewer::loadMeshFile(const QString &path)
     return false;
   }
 
+  // Ensure array has a name and make it active on the source dataset (and on surface after extraction)
+  const char *arrNameC = scalars->GetName();
+  std::string arrNameStd;
+  if (!arrNameC)
+  {
+    arrNameStd = "conductivity";
+    scalars->SetName(arrNameStd.c_str());
+    arrNameC = scalars->GetName();
+  }
+  else
+  {
+    arrNameStd = arrNameC;
+  }
+  qDebug() << "Using scalar array:" << arrNameC;
+  pd->SetActiveScalars(arrNameC);
+
   double range[2];
   scalars->GetRange(range);
-
-  // Build lookup table
   lookupTable_ = vtkSmartPointer<vtkLookupTable>::New();
   lookupTable_->SetNumberOfTableValues(256);
   lookupTable_->SetRange(range);
@@ -238,6 +546,15 @@ bool ConductivityViewer::loadMeshFile(const QString &path)
     surf->SetInputData(pointDataSource);
     surf->Update();
     surfacePoly = surf->GetOutput();
+    // Ensure point scalars are present on the generated surface polydata.
+    // Use vtkProbeFilter to sample the original pointDataSource onto the surface
+    // geometry — this attaches the exact point-data arrays (by interpolation or
+    // direct mapping) to the surface points so the mapper can use them.
+    vtkNew<vtkProbeFilter> surfaceProbe;
+    surfaceProbe->SetInputData(surfacePoly);
+    surfaceProbe->SetSourceData(pointDataSource);
+    surfaceProbe->Update();
+    surfacePoly = vtkPolyData::SafeDownCast(surfaceProbe->GetOutput());
   }
   else if (vtkPolyData::SafeDownCast(pointDataSource))
   {
@@ -252,8 +569,10 @@ bool ConductivityViewer::loadMeshFile(const QString &path)
   // Setup mapper & actor
   surfaceMapper_ = vtkSmartPointer<vtkPolyDataMapper>::New();
   surfaceMapper_->SetInputData(surfacePoly);
+  // Use point field data by name to ensure correct array is mapped
   surfaceMapper_->SetLookupTable(lookupTable_);
-  surfaceMapper_->SetScalarModeToUsePointData();
+  surfaceMapper_->SetScalarModeToUsePointFieldData();
+  surfaceMapper_->SelectColorArray(arrNameStd.c_str());
   surfaceMapper_->ScalarVisibilityOn();
   surfaceMapper_->SetColorModeToMapScalars();
   surfaceMapper_->SetScalarRange(range);
@@ -271,7 +590,7 @@ bool ConductivityViewer::loadMeshFile(const QString &path)
   scalarBar_ = vtkSmartPointer<vtkScalarBarActor>::New();
   scalarBar_->SetLookupTable(lookupTable_);
   scalarBar_->SetTitle(scalars->GetName() ? scalars->GetName() : "Scalar");
-  vtkTextProperty* tp = scalarBar_->GetLabelTextProperty();
+  vtkTextProperty *tp = scalarBar_->GetLabelTextProperty();
   tp->SetFontSize(12);
   renderer_->AddActor2D(scalarBar_);
 
@@ -280,9 +599,12 @@ bool ConductivityViewer::loadMeshFile(const QString &path)
   double dx = dataBounds_[1] - dataBounds_[0];
   double dy = dataBounds_[3] - dataBounds_[2];
   double dz = dataBounds_[5] - dataBounds_[4];
-  if (dx >= dy && dx >= dz) sliceAxis_ = 0;
-  else if (dy >= dx && dy >= dz) sliceAxis_ = 1;
-  else sliceAxis_ = 2;
+  if (dx >= dy && dx >= dz)
+    sliceAxis_ = 0;
+  else if (dy >= dx && dy >= dz)
+    sliceAxis_ = 1;
+  else
+    sliceAxis_ = 2;
 
   // Create slice plane and cutter
   slicePlane_ = vtkSmartPointer<vtkPlane>::New();
@@ -290,8 +612,8 @@ bool ConductivityViewer::loadMeshFile(const QString &path)
   normal[sliceAxis_] = 1.0;
   slicePlane_->SetNormal(normal);
   // initial position at slider value
-  double pos0 = dataBounds_[2*sliceAxis_] + 0.5*(dataBounds_[2*sliceAxis_+1] - dataBounds_[2*sliceAxis_]);
-  double origin0[3] = { (dataBounds_[0]+dataBounds_[1])/2.0, (dataBounds_[2]+dataBounds_[3])/2.0, (dataBounds_[4]+dataBounds_[5])/2.0 };
+  double pos0 = dataBounds_[2 * sliceAxis_] + 0.5 * (dataBounds_[2 * sliceAxis_ + 1] - dataBounds_[2 * sliceAxis_]);
+  double origin0[3] = {(dataBounds_[0] + dataBounds_[1]) / 2.0, (dataBounds_[2] + dataBounds_[3]) / 2.0, (dataBounds_[4] + dataBounds_[5]) / 2.0};
   origin0[sliceAxis_] = pos0;
   slicePlane_->SetOrigin(origin0);
 
@@ -301,9 +623,18 @@ bool ConductivityViewer::loadMeshFile(const QString &path)
   sliceCutter_->Update();
 
   sliceMapper_ = vtkSmartPointer<vtkPolyDataMapper>::New();
-  sliceMapper_->SetInputData(sliceCutter_->GetOutput());
+  // Probe cutter output with original pointDataSource to ensure scalars are
+  // present on the slice polydata (some pipeline steps may lose point arrays).
+  // Create a persistent probe filter that samples the original point data onto
+  // the slice geometry. Use SetInputConnection so the probe follows the cutter
+  // output when the slice plane origin changes.
+  sliceProbe_ = vtkSmartPointer<vtkProbeFilter>::New();
+  sliceProbe_->SetInputConnection(sliceCutter_->GetOutputPort());
+  sliceProbe_->SetSourceData(pointDataSource);
+  sliceMapper_->SetInputConnection(sliceProbe_->GetOutputPort());
   sliceMapper_->SetLookupTable(lookupTable_);
-  sliceMapper_->SetScalarModeToUsePointData();
+  sliceMapper_->SetScalarModeToUsePointFieldData();
+  sliceMapper_->SelectColorArray(arrNameStd.c_str());
   sliceMapper_->ScalarVisibilityOn();
   sliceMapper_->SetScalarRange(range);
 
@@ -316,7 +647,7 @@ bool ConductivityViewer::loadMeshFile(const QString &path)
   if (vtkWidget_ && vtkWidget_->renderWindow())
   {
     // Remove previous renderers to avoid duplicates
-    vtkRenderWindow* rw = vtkWidget_->renderWindow();
+    vtkRenderWindow *rw = vtkWidget_->renderWindow();
     // ensure renderer is present (remove any previous instance then add)
     rw->RemoveRenderer(renderer_.Get());
     rw->AddRenderer(renderer_.Get());
@@ -329,8 +660,8 @@ bool ConductivityViewer::loadMeshFile(const QString &path)
   return true;
 }
 
-ConductivityViewer::ConductivityViewer(QWidget* parent, const QString& initialMesh)
-  : QMainWindow(parent)
+ConductivityViewer::ConductivityViewer(QWidget *parent, const QString &initialMesh)
+    : QMainWindow(parent)
 {
   setupUi();
   if (!initialMesh.isEmpty())
@@ -340,13 +671,13 @@ ConductivityViewer::ConductivityViewer(QWidget* parent, const QString& initialMe
 void ConductivityViewer::setupUi()
 {
   // central widget and layout
-  QWidget* central = new QWidget(this);
+  QWidget *central = new QWidget(this);
   setCentralWidget(central);
-  QHBoxLayout* mainLayout = new QHBoxLayout(central);
+  QHBoxLayout *mainLayout = new QHBoxLayout(central);
 
   // left controls
-  QWidget* left = new QWidget(central);
-  QVBoxLayout* leftLayout = new QVBoxLayout(left);
+  QWidget *left = new QWidget(central);
+  QVBoxLayout *leftLayout = new QVBoxLayout(left);
   left->setLayout(leftLayout);
 
   renderModeCombo_ = new QComboBox(left);
@@ -381,8 +712,8 @@ void ConductivityViewer::setupUi()
   mainLayout->addWidget(vtkWidget_, 1);
 
   // Menu
-  QMenu* fileMenu = menuBar()->addMenu(tr("&File"));
-  QAction* openAct = new QAction(tr("Open..."), this);
+  QMenu *fileMenu = menuBar()->addMenu(tr("&File"));
+  QAction *openAct = new QAction(tr("Open..."), this);
   fileMenu->addAction(openAct);
   connect(openAct, &QAction::triggered, this, &ConductivityViewer::openMesh);
 
@@ -411,11 +742,11 @@ void ConductivityViewer::onSliceSliderChanged(int value)
   }
 
   double t = value / 100.0;
-  double minv = dataBounds_[2*sliceAxis_];
-  double maxv = dataBounds_[2*sliceAxis_+1];
+  double minv = dataBounds_[2 * sliceAxis_];
+  double maxv = dataBounds_[2 * sliceAxis_ + 1];
   double pos = minv + t * (maxv - minv);
 
-  double origin[3] = { (dataBounds_[0]+dataBounds_[1])/2.0, (dataBounds_[2]+dataBounds_[3])/2.0, (dataBounds_[4]+dataBounds_[5])/2.0 };
+  double origin[3] = {(dataBounds_[0] + dataBounds_[1]) / 2.0, (dataBounds_[2] + dataBounds_[3]) / 2.0, (dataBounds_[4] + dataBounds_[5]) / 2.0};
   origin[sliceAxis_] = pos;
   slicePlane_->SetOrigin(origin);
   sliceCutter_->Update();

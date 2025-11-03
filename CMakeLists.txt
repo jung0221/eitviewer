@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 # Enable C as well because some dependencies (VTK) may require MPI C targets
-project(condviz_gui LANGUAGES C CXX)
+project(eitviewer LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

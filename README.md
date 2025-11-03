@@ -22,7 +22,7 @@ cd build
 cmake ..
 cmake --build .
 # run
-./condviz_gui
+./eitviewer
 ```
 
 Notes

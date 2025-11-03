@@ -6,7 +6,7 @@
 int main(int argc, char** argv) {
   QApplication app(argc, argv);
 
-  QCoreApplication::setApplicationName("condviz_gui");
+  QCoreApplication::setApplicationName("eitviewer");
   QCoreApplication::setApplicationVersion("0.1");
 
   QCommandLineParser parser;
