@@ -77,7 +77,7 @@
  * @param path Path to mesh file (.msh, .vtu, .vtk, ...)
  * @return true on success, false on failure
  */
-bool ConductivityViewer::loadMeshFile(const QString &path)
+bool ConductivityViewer::loadMeshFile(const QString &path, int side)
 {
   // try several readers based on extension
   std::string ext = QFileInfo(path).suffix().toLower().toStdString();
@@ -377,6 +377,10 @@ bool ConductivityViewer::loadMeshFile(const QString &path)
     // Try parsing the .msh directly (pure C++). If successful, we will skip
     // external conversion and use the in-memory unstructured grid.
     vtkSmartPointer<vtkUnstructuredGrid> parsedGrid = parseMshFile(path);
+    if (parsedGrid && parsedGrid->GetNumberOfPoints() > 0)
+    {
+      data = parsedGrid;
+    }
 
     // Prefer using Python + meshio so we avoid launching gmsh GUI. Try several python executables
     QStringList pythonCandidates;
@@ -493,6 +497,22 @@ bool ConductivityViewer::loadMeshFile(const QString &path)
   vtkSmartPointer<vtkDataSet> ds = data;
   vtkSmartPointer<vtkDataSet> pointDataSource = ds;
 
+  // choose which side's pipeline to populate
+  vtkSmartPointer<vtkLookupTable>* lookupPtr = (side == 0) ? &lookupTable_ : &lookupTableRight_;
+  vtkSmartPointer<vtkPolyDataMapper>* surfaceMapperPtr = (side == 0) ? &surfaceMapper_ : &surfaceMapperRight_;
+  vtkSmartPointer<vtkActor>* surfaceActorPtr = (side == 0) ? &surfaceActor_ : &surfaceActorRight_;
+  vtkSmartPointer<vtkScalarBarActor>* scalarBarPtr = (side == 0) ? &scalarBar_ : &scalarBarRight_;
+  vtkSmartPointer<vtkPlane>* slicePlanePtr = (side == 0) ? &slicePlane_ : &slicePlaneRight_;
+  vtkSmartPointer<vtkCutter>* sliceCutterPtr = (side == 0) ? &sliceCutter_ : &sliceCutterRight_;
+  vtkSmartPointer<vtkPolyDataMapper>* sliceMapperPtr = (side == 0) ? &sliceMapper_ : &sliceMapperRight_;
+  vtkSmartPointer<vtkActor>* sliceActorPtr = (side == 0) ? &sliceActor_ : &sliceActorRight_;
+  vtkSmartPointer<vtkProbeFilter>* sliceProbePtr = (side == 0) ? &sliceProbe_ : &sliceProbeRight_;
+  vtkSmartPointer<vtkRenderer>* rendererPtr = (side == 0) ? &renderer_ : &rendererRight_;
+  double* boundsPtr = (side == 0) ? dataBounds_ : dataBoundsRight_;
+  int* sliceAxisPtr = (side == 0) ? &sliceAxis_ : &sliceAxisRight_;
+  QVTKOpenGLNativeWidget* widget = (side == 0) ? vtkWidget_ : vtkWidgetRight_;
+  QString* currentMeshPathPtr = (side == 0) ? &currentMeshPath_ : &currentMeshPathRight_;
+
   // If there is cell data but no point data, convert
   if (ds->GetPointData()->GetNumberOfArrays() == 0 && ds->GetCellData()->GetNumberOfArrays() > 0)
   {
@@ -533,10 +553,10 @@ bool ConductivityViewer::loadMeshFile(const QString &path)
 
   double range[2];
   scalars->GetRange(range);
-  lookupTable_ = vtkSmartPointer<vtkLookupTable>::New();
-  lookupTable_->SetNumberOfTableValues(256);
-  lookupTable_->SetRange(range);
-  lookupTable_->Build();
+  (*lookupPtr) = vtkSmartPointer<vtkLookupTable>::New();
+  (*lookupPtr)->SetNumberOfTableValues(256);
+  (*lookupPtr)->SetRange(range);
+  (*lookupPtr)->Build();
 
   // Create surface polydata for rendering
   vtkSmartPointer<vtkPolyData> surfacePoly;
@@ -567,105 +587,107 @@ bool ConductivityViewer::loadMeshFile(const QString &path)
   }
 
   // Setup mapper & actor
-  surfaceMapper_ = vtkSmartPointer<vtkPolyDataMapper>::New();
-  surfaceMapper_->SetInputData(surfacePoly);
+  (*surfaceMapperPtr) = vtkSmartPointer<vtkPolyDataMapper>::New();
+  (*surfaceMapperPtr)->SetInputData(surfacePoly);
   // Use point field data by name to ensure correct array is mapped
-  surfaceMapper_->SetLookupTable(lookupTable_);
-  surfaceMapper_->SetScalarModeToUsePointFieldData();
-  surfaceMapper_->SelectColorArray(arrNameStd.c_str());
-  surfaceMapper_->ScalarVisibilityOn();
-  surfaceMapper_->SetColorModeToMapScalars();
-  surfaceMapper_->SetScalarRange(range);
+  (*surfaceMapperPtr)->SetLookupTable((*lookupPtr));
+  (*surfaceMapperPtr)->SetScalarModeToUsePointFieldData();
+  (*surfaceMapperPtr)->SelectColorArray(arrNameStd.c_str());
+  (*surfaceMapperPtr)->ScalarVisibilityOn();
+  (*surfaceMapperPtr)->SetColorModeToMapScalars();
+  (*surfaceMapperPtr)->SetScalarRange(range);
 
-  surfaceActor_ = vtkSmartPointer<vtkActor>::New();
-  surfaceActor_->SetMapper(surfaceMapper_);
+  (*surfaceActorPtr) = vtkSmartPointer<vtkActor>::New();
+  (*surfaceActorPtr)->SetMapper((*surfaceMapperPtr));
 
   // Add to renderer
-  if (!renderer_)
-    renderer_ = vtkSmartPointer<vtkRenderer>::New();
-  renderer_->RemoveAllViewProps();
-  renderer_->AddActor(surfaceActor_);
+  if (!(*rendererPtr))
+    (*rendererPtr) = vtkSmartPointer<vtkRenderer>::New();
+  (*rendererPtr)->RemoveAllViewProps();
+  (*rendererPtr)->AddActor((*surfaceActorPtr));
 
   // Scalar bar
-  scalarBar_ = vtkSmartPointer<vtkScalarBarActor>::New();
-  scalarBar_->SetLookupTable(lookupTable_);
-  scalarBar_->SetTitle(scalars->GetName() ? scalars->GetName() : "Scalar");
-  vtkTextProperty *tp = scalarBar_->GetLabelTextProperty();
+  (*scalarBarPtr) = vtkSmartPointer<vtkScalarBarActor>::New();
+  (*scalarBarPtr)->SetLookupTable((*lookupPtr));
+  (*scalarBarPtr)->SetTitle(scalars->GetName() ? scalars->GetName() : "Scalar");
+  vtkTextProperty *tp = (*scalarBarPtr)->GetLabelTextProperty();
   tp->SetFontSize(12);
-  renderer_->AddActor2D(scalarBar_);
+  (*rendererPtr)->AddActor2D((*scalarBarPtr));
 
   // Store bounds and choose largest axis for slicing
-  pointDataSource->GetBounds(dataBounds_);
-  double dx = dataBounds_[1] - dataBounds_[0];
-  double dy = dataBounds_[3] - dataBounds_[2];
-  double dz = dataBounds_[5] - dataBounds_[4];
+  pointDataSource->GetBounds(boundsPtr);
+  double dx = boundsPtr[1] - boundsPtr[0];
+  double dy = boundsPtr[3] - boundsPtr[2];
+  double dz = boundsPtr[5] - boundsPtr[4];
   if (dx >= dy && dx >= dz)
-    sliceAxis_ = 0;
+    *sliceAxisPtr = 0;
   else if (dy >= dx && dy >= dz)
-    sliceAxis_ = 1;
+    *sliceAxisPtr = 1;
   else
-    sliceAxis_ = 2;
+    *sliceAxisPtr = 2;
 
   // Create slice plane and cutter
-  slicePlane_ = vtkSmartPointer<vtkPlane>::New();
+  (*slicePlanePtr) = vtkSmartPointer<vtkPlane>::New();
   double normal[3] = {0.0, 0.0, 0.0};
-  normal[sliceAxis_] = 1.0;
-  slicePlane_->SetNormal(normal);
+  normal[*sliceAxisPtr] = 1.0;
+  (*slicePlanePtr)->SetNormal(normal);
   // initial position at slider value
-  double pos0 = dataBounds_[2 * sliceAxis_] + 0.5 * (dataBounds_[2 * sliceAxis_ + 1] - dataBounds_[2 * sliceAxis_]);
-  double origin0[3] = {(dataBounds_[0] + dataBounds_[1]) / 2.0, (dataBounds_[2] + dataBounds_[3]) / 2.0, (dataBounds_[4] + dataBounds_[5]) / 2.0};
-  origin0[sliceAxis_] = pos0;
-  slicePlane_->SetOrigin(origin0);
+  double pos0 = boundsPtr[2 * (*sliceAxisPtr)] + 0.5 * (boundsPtr[2 * (*sliceAxisPtr) + 1] - boundsPtr[2 * (*sliceAxisPtr)]);
+  double origin0[3] = {(boundsPtr[0] + boundsPtr[1]) / 2.0, (boundsPtr[2] + boundsPtr[3]) / 2.0, (boundsPtr[4] + boundsPtr[5]) / 2.0};
+  origin0[*sliceAxisPtr] = pos0;
+  (*slicePlanePtr)->SetOrigin(origin0);
 
-  sliceCutter_ = vtkSmartPointer<vtkCutter>::New();
-  sliceCutter_->SetCutFunction(slicePlane_.Get());
-  sliceCutter_->SetInputData(pointDataSource);
-  sliceCutter_->Update();
+  (*sliceCutterPtr) = vtkSmartPointer<vtkCutter>::New();
+  (*sliceCutterPtr)->SetCutFunction((*slicePlanePtr).Get());
+  (*sliceCutterPtr)->SetInputData(pointDataSource);
+  (*sliceCutterPtr)->Update();
 
-  sliceMapper_ = vtkSmartPointer<vtkPolyDataMapper>::New();
+  (*sliceMapperPtr) = vtkSmartPointer<vtkPolyDataMapper>::New();
   // Probe cutter output with original pointDataSource to ensure scalars are
   // present on the slice polydata (some pipeline steps may lose point arrays).
   // Create a persistent probe filter that samples the original point data onto
   // the slice geometry. Use SetInputConnection so the probe follows the cutter
   // output when the slice plane origin changes.
-  sliceProbe_ = vtkSmartPointer<vtkProbeFilter>::New();
-  sliceProbe_->SetInputConnection(sliceCutter_->GetOutputPort());
-  sliceProbe_->SetSourceData(pointDataSource);
-  sliceMapper_->SetInputConnection(sliceProbe_->GetOutputPort());
-  sliceMapper_->SetLookupTable(lookupTable_);
-  sliceMapper_->SetScalarModeToUsePointFieldData();
-  sliceMapper_->SelectColorArray(arrNameStd.c_str());
-  sliceMapper_->ScalarVisibilityOn();
-  sliceMapper_->SetScalarRange(range);
+  (*sliceProbePtr) = vtkSmartPointer<vtkProbeFilter>::New();
+  (*sliceProbePtr)->SetInputConnection((*sliceCutterPtr)->GetOutputPort());
+  (*sliceProbePtr)->SetSourceData(pointDataSource);
+  (*sliceMapperPtr)->SetInputConnection((*sliceProbePtr)->GetOutputPort());
+  (*sliceMapperPtr)->SetLookupTable((*lookupPtr));
+  (*sliceMapperPtr)->SetScalarModeToUsePointFieldData();
+  (*sliceMapperPtr)->SelectColorArray(arrNameStd.c_str());
+  (*sliceMapperPtr)->ScalarVisibilityOn();
+  (*sliceMapperPtr)->SetScalarRange(range);
 
-  sliceActor_ = vtkSmartPointer<vtkActor>::New();
-  sliceActor_->SetMapper(sliceMapper_);
-  sliceActor_->GetProperty()->SetLineWidth(2.0);
-  renderer_->AddActor(sliceActor_);
+  (*sliceActorPtr) = vtkSmartPointer<vtkActor>::New();
+  (*sliceActorPtr)->SetMapper((*sliceMapperPtr));
+  (*sliceActorPtr)->GetProperty()->SetLineWidth(2.0);
+  (*rendererPtr)->AddActor((*sliceActorPtr));
 
   // Attach renderer to widget's render window
-  if (vtkWidget_ && vtkWidget_->renderWindow())
+  if (widget && widget->renderWindow())
   {
     // Remove previous renderers to avoid duplicates
-    vtkRenderWindow *rw = vtkWidget_->renderWindow();
+    vtkRenderWindow *rw = widget->renderWindow();
     // ensure renderer is present (remove any previous instance then add)
-    rw->RemoveRenderer(renderer_.Get());
-    rw->AddRenderer(renderer_.Get());
+    rw->RemoveRenderer((*rendererPtr).Get());
+    rw->AddRenderer((*rendererPtr).Get());
     rw->Render();
   }
 
   statusBar()->showMessage(tr("Loaded mesh: %1").arg(path));
-  currentMeshPath_ = path;
+  *currentMeshPathPtr = path;
 
   return true;
 }
 
-ConductivityViewer::ConductivityViewer(QWidget *parent, const QString &initialMesh)
+ConductivityViewer::ConductivityViewer(QWidget *parent, const QString &initialLeftMesh, const QString &initialRightMesh)
     : QMainWindow(parent)
 {
   setupUi();
-  if (!initialMesh.isEmpty())
-    loadMeshFile(initialMesh);
+  if (!initialLeftMesh.isEmpty())
+    loadMeshFile(initialLeftMesh, 0);
+  if (!initialRightMesh.isEmpty())
+    loadMeshFile(initialRightMesh, 1);
 }
 
 void ConductivityViewer::setupUi()
@@ -701,21 +723,32 @@ void ConductivityViewer::setupUi()
 
   leftLayout->addStretch(1);
 
-  // VTK widget
-  vtkWidget_ = new QVTKOpenGLNativeWidget(central);
+  // VTK widgets (left and right) inside a container so they appear side-by-side
+  QWidget* viewContainer = new QWidget(central);
+  QHBoxLayout* viewLayout = new QHBoxLayout(viewContainer);
+  vtkWidget_ = new QVTKOpenGLNativeWidget(viewContainer);
+  vtkWidgetRight_ = new QVTKOpenGLNativeWidget(viewContainer);
+  viewLayout->addWidget(vtkWidget_);
+  viewLayout->addWidget(vtkWidgetRight_);
 
   // Make window reasonably large by default
-  resize(1200, 800);
-  setMinimumSize(800, 600);
+  resize(1400, 800);
+  setMinimumSize(1000, 600);
 
   mainLayout->addWidget(left);
-  mainLayout->addWidget(vtkWidget_, 1);
+  mainLayout->addWidget(viewContainer, 1);
 
   // Menu
   QMenu *fileMenu = menuBar()->addMenu(tr("&File"));
   QAction *openAct = new QAction(tr("Open..."), this);
   fileMenu->addAction(openAct);
   connect(openAct, &QAction::triggered, this, &ConductivityViewer::openMesh);
+  QAction *openPredAct = new QAction(tr("Open Predicted..."), this);
+  fileMenu->addAction(openPredAct);
+  connect(openPredAct, &QAction::triggered, this, &ConductivityViewer::openPredictedMesh);
+  QAction *openTgtAct = new QAction(tr("Open Target..."), this);
+  fileMenu->addAction(openTgtAct);
+  connect(openTgtAct, &QAction::triggered, this, &ConductivityViewer::openTargetMesh);
 
   // Connect controls
   connect(sliceSlider_, &QSlider::valueChanged, this, &ConductivityViewer::onSliceSliderChanged);
@@ -730,29 +763,60 @@ void ConductivityViewer::openMesh()
 {
   QString path = QFileDialog::getOpenFileName(this, tr("Open mesh"), QString(), tr("Meshes (*.msh *.vtu *.vtk);;All files (*)"));
   if (!path.isEmpty())
-    loadMeshFile(path);
+    loadMeshFile(path, 0);
+}
+
+void ConductivityViewer::openPredictedMesh()
+{
+  QString path = QFileDialog::getOpenFileName(this, tr("Open predicted mesh"), QString(), tr("Meshes (*.msh *.vtu *.vtk);;All files (*)"));
+  if (!path.isEmpty())
+    loadMeshFile(path, 1);
+}
+
+void ConductivityViewer::openTargetMesh()
+{
+  QString path = QFileDialog::getOpenFileName(this, tr("Open target mesh"), QString(), tr("Meshes (*.msh *.vtu *.vtk);;All files (*)"));
+  if (!path.isEmpty())
+    loadMeshFile(path, 0);
 }
 
 void ConductivityViewer::onSliceSliderChanged(int value)
 {
-  if (!slicePlane_ || !sliceCutter_)
+  if (!slicePlane_ && !slicePlaneRight_)
   {
     statusBar()->showMessage(tr("No slice available"));
     return;
   }
 
   double t = value / 100.0;
-  double minv = dataBounds_[2 * sliceAxis_];
-  double maxv = dataBounds_[2 * sliceAxis_ + 1];
-  double pos = minv + t * (maxv - minv);
+  // left view
+  if (slicePlane_ && sliceCutter_)
+  {
+    double minv = dataBounds_[2 * sliceAxis_];
+    double maxv = dataBounds_[2 * sliceAxis_ + 1];
+    double pos = minv + t * (maxv - minv);
+    double origin[3] = {(dataBounds_[0] + dataBounds_[1]) / 2.0, (dataBounds_[2] + dataBounds_[3]) / 2.0, (dataBounds_[4] + dataBounds_[5]) / 2.0};
+    origin[sliceAxis_] = pos;
+    slicePlane_->SetOrigin(origin);
+    sliceCutter_->Update();
+  }
 
-  double origin[3] = {(dataBounds_[0] + dataBounds_[1]) / 2.0, (dataBounds_[2] + dataBounds_[3]) / 2.0, (dataBounds_[4] + dataBounds_[5]) / 2.0};
-  origin[sliceAxis_] = pos;
-  slicePlane_->SetOrigin(origin);
-  sliceCutter_->Update();
+  // right view (use same normalized slider t but apply to right bounds)
+  if (slicePlaneRight_ && sliceCutterRight_)
+  {
+    double minv = dataBoundsRight_[2 * sliceAxisRight_];
+    double maxv = dataBoundsRight_[2 * sliceAxisRight_ + 1];
+    double pos = minv + t * (maxv - minv);
+    double origin[3] = {(dataBoundsRight_[0] + dataBoundsRight_[1]) / 2.0, (dataBoundsRight_[2] + dataBoundsRight_[3]) / 2.0, (dataBoundsRight_[4] + dataBoundsRight_[5]) / 2.0};
+    origin[sliceAxisRight_] = pos;
+    slicePlaneRight_->SetOrigin(origin);
+    sliceCutterRight_->Update();
+  }
 
   if (vtkWidget_ && vtkWidget_->renderWindow())
     vtkWidget_->renderWindow()->Render();
+  if (vtkWidgetRight_ && vtkWidgetRight_->renderWindow())
+    vtkWidgetRight_->renderWindow()->Render();
 
   statusBar()->showMessage(tr("Slice moved to %1%").arg(value));
 }
@@ -769,8 +833,12 @@ void ConductivityViewer::onOpacityChanged(int value)
   double op = value / 100.0;
   if (surfaceActor_)
     surfaceActor_->GetProperty()->SetOpacity(op);
+  if (surfaceActorRight_)
+    surfaceActorRight_->GetProperty()->SetOpacity(op);
   if (vtkWidget_ && vtkWidget_->renderWindow())
     vtkWidget_->renderWindow()->Render();
+  if (vtkWidgetRight_ && vtkWidgetRight_->renderWindow())
+    vtkWidgetRight_->renderWindow()->Render();
 }
 
 void ConductivityViewer::resetCamera()
